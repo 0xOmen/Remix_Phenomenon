@@ -1,0 +1,579 @@
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.7;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/utils/Strings.sol";
+
+error Game__NotOpen();
+error Game__WrongAmountSent();
+error Game__WrongTokenSent();
+error Game__Full();
+error Game__AlreadyRegistered();
+error Game__NotEnoughProphets();
+error Game__NotInProgress();
+error Game__ProphetIsDead();
+error Game__NotAllowed();
+error Game__NotEnoughTicketsOwned();
+error Game__AddressIsEliminated();
+error Game__ProphetNotFree();
+error Game__OutOfTurn();
+
+contract Phenomenon {
+    enum GameState{
+        OPEN,
+        IN_PROGRESS,
+        AWAITING_RESPONSE,
+        ENDED
+    }
+
+    enum ProphetAction{
+        MIRACLE,
+        SMITE,
+        ACCUSE,
+        IDLE
+    }
+
+    struct ProphetData {
+        address playerAddress;
+        bool isAlive;
+        bool isFree;
+        ProphetAction currentAction;
+        uint256 args;
+    }
+
+    uint256 INTERVAL;           //3 minutes = 180
+    uint256 ENTRANCE_FEE;
+    uint16 NUMBER_OF_PROPHETS;
+    address GAME_TOKEN;
+
+    uint256 tokenBalance;
+    uint256 lastRoundTimestamp;
+    mapping (address => uint256) prophetList;
+    ProphetData[] public prophets;
+    GameState public gameStatus;
+    uint256 public prophetsRemaining;
+    uint256 roleVRFSeed;
+    bytes latestResponse;
+    bytes latestError;
+    uint256 public gameRound;
+    uint256 public currentProphetTurn;
+
+    // mapping of which prophet each address holds allegiance tickets to
+    mapping (address => uint256) public allegiance;
+    // mapping of how many tickets an address owns
+    mapping (address => uint256) public ticketsToValhalla;
+    //tracks how many tickets to heaven have been sold for each Prophet
+    uint256[] public accolites;
+    uint256 public totalTickets;
+
+    event ProphetEnteredGame(address indexed prophet);
+    event GameStarted(ProphetData[] indexed prophets);
+    event TicketsBought(address indexed buyer, uint256 indexed numberOfTickets, uint256 indexed price);
+    event TicketsSold(address indexed _sellerAddress, uint256 indexed ticketsSold, uint256 indexed totalPrice);
+    event MiracleAttempt(uint256 indexed prophet, bool indexed successful);
+    event SmiteAttempt(uint256 indexed prophet, uint256 indexed target, bool indexed successful);
+    event AccusationAttempt(uint256 indexed playerNum, uint256 indexed target, bool indexed successful);
+
+    constructor(
+        uint256 _interval,
+        uint256 _entranceFee,
+        uint16 _numProphets,
+        address _gameToken
+    ) {
+        INTERVAL = _interval;
+        ENTRANCE_FEE = _entranceFee;
+        NUMBER_OF_PROPHETS = _numProphets;
+        prophetsRemaining = _numProphets;
+        gameStatus = GameState.OPEN;
+        lastRoundTimestamp = block.timestamp;
+        gameRound = 0;
+
+        GAME_TOKEN = _gameToken;
+        tokenBalance = 0;
+    }
+
+    function enterGame(address _tokenAddress, uint256 _amount) public {
+        if(_amount != ENTRANCE_FEE){
+            revert Game__WrongAmountSent();
+        }
+        if(_tokenAddress != GAME_TOKEN){
+            revert Game__WrongTokenSent();
+        }
+        if(gameStatus != GameState.OPEN){
+            revert Game__NotOpen();
+        }
+        if(prophets.length >= NUMBER_OF_PROPHETS){
+            revert Game__Full();
+        }
+        for(uint256 prophet = 0; prophet < prophets.length; prophet++){
+            if(prophets[prophet].playerAddress == msg.sender){
+                revert Game__AlreadyRegistered();
+            }
+        }
+        ProphetData memory newProphet;
+        newProphet.playerAddress = msg.sender;
+        newProphet.isAlive = true;
+        newProphet.isFree = true;
+        newProphet.currentAction = ProphetAction.IDLE;
+        prophets.push(newProphet);
+        tokenBalance += _amount;
+        prophetList[msg.sender] = 1;
+        emit ProphetEnteredGame(msg.sender);
+
+        IERC20(_tokenAddress).transferFrom(
+            msg.sender,
+            address(this),
+            _amount
+        );
+    }
+
+    function startGame() public {
+        if(gameStatus != GameState.OPEN) {
+            revert Game__NotOpen();
+        }
+        if(prophets.length != NUMBER_OF_PROPHETS){
+            revert Game__NotEnoughProphets();
+        }
+        gameStatus = GameState.IN_PROGRESS;
+        // This will need to be changed to Chainlink VRF generated seed
+        roleVRFSeed = block.number;
+        uint256 action = 3;
+        currentProphetTurn = block.timestamp % NUMBER_OF_PROPHETS;
+        sendRequest(action, roleVRFSeed, 0, 0);
+        
+        emit GameStarted(prophets);
+    }
+
+    // game needs to be playing, prophet must be alive
+    function attemptSmite(uint256 _target) public {
+        // Game must be in progress
+        if(gameStatus != GameState.IN_PROGRESS){
+            revert Game__NotInProgress();
+        }
+        // Prophet to smite must be alive and exist
+        if(prophets[_target].isAlive == false || _target >= NUMBER_OF_PROPHETS) {
+            revert Game__NotAllowed();
+        }
+        // Sending address must be a living prophet and must be their turn        
+        if(msg.sender != prophets[currentProphetTurn].playerAddress){
+            revert Game__OutOfTurn();
+        } else{
+            if(prophets[currentProphetTurn].isAlive == false){
+                revert Game__ProphetIsDead();
+            }
+            prophets[currentProphetTurn].currentAction = ProphetAction.SMITE;
+            prophets[currentProphetTurn].args = _target;
+            sendRequest(1, roleVRFSeed, currentProphetTurn, _target);
+        }
+    }
+
+    function performMiracle() public {
+        // Game must be in progress
+        if(gameStatus != GameState.IN_PROGRESS){
+            revert Game__NotInProgress();
+        }
+        // Can only be called by a living prophet on their turn
+        if(msg.sender != prophets[currentProphetTurn].playerAddress){
+            revert Game__OutOfTurn();
+        } else{
+            if(prophets[currentProphetTurn].isAlive == false){
+                revert Game__ProphetIsDead();
+            }
+            prophets[currentProphetTurn].currentAction = ProphetAction.MIRACLE;
+            sendRequest(0, roleVRFSeed, currentProphetTurn, 0);
+        }
+    }
+
+    function accuseOfBlasphemy(uint256 _target) public {
+        // Game must be in progress
+        if(gameStatus != GameState.IN_PROGRESS){
+            revert Game__NotInProgress();
+        }
+        // Prophet to accuse must be alive and exist
+        if(prophets[_target].isAlive == false || _target >= NUMBER_OF_PROPHETS) {
+            revert Game__NotAllowed();
+        }
+        // Message Sender must be living & free prophet on their turn
+        if(msg.sender != prophets[currentProphetTurn].playerAddress){
+            revert Game__OutOfTurn();
+        } else{
+            if(prophets[currentProphetTurn].isAlive == false){
+                revert Game__ProphetIsDead();
+            }
+            if(prophets[currentProphetTurn].isFree == false){
+                revert Game__ProphetNotFree();
+            }
+            prophets[currentProphetTurn].currentAction = ProphetAction.ACCUSE;
+            sendRequest(2, roleVRFSeed, currentProphetTurn, _target);
+        }
+    }
+
+    function forceTurn() public {
+        if(block.timestamp < lastRoundTimestamp+INTERVAL || gameStatus != GameState.IN_PROGRESS){
+            revert Game__NotAllowed();
+        }
+        sendRequest(0, roleVRFSeed, currentProphetTurn, 0);
+    }
+///////////////////////////////////////////////////////////////////////////////////
+//////////////////       Functions to execute OffChain          ///////////////////
+///////////////////////////////////////////////////////////////////////////////////
+    //This function will change into a request to chainlink with data saved: latestRequestId
+    function sendRequest(
+        uint256 action,
+        uint256 _roleVRFSeed, 
+        uint256 playerNum, 
+        uint256 _args) 
+        public {
+            string memory response;
+
+            //determine chosenOne
+            uint256 chosenOne = (_roleVRFSeed % NUMBER_OF_PROPHETS);
+            uint256 _ticketShare = getTicketShare(playerNum);
+            gameStatus = GameState.AWAITING_RESPONSE;
+            
+            // action == 0 then attempt miracle
+            if(action == 0){
+                if(performMiracle(playerNum, chosenOne, _roleVRFSeed, _ticketShare)){
+                    response = string.concat(response, "1");
+                }else {
+                    response = string.concat(response, "0");
+                }
+
+                response = string.concat(response, Strings.toString(playerNum));
+
+                if(prophets[playerNum].isFree){
+                    response = string.concat(response, "0");
+                } else response = string.concat(response, "1");
+            }
+            // action == 1 then attempt to smite
+            else if(action == 1){
+                if(attemptToSmite(playerNum, chosenOne, _ticketShare)){
+                    response = string.concat(response, "3");
+                }else {
+                        response = string.concat(response, "2");
+                }
+                response = string.concat(response, Strings.toString(playerNum));
+                response = string.concat(response, Strings.toString(_args));
+            }else if(action == 2){
+                if(accuse(playerNum, _ticketShare)){
+                    response = string.concat(response, "5");
+                }else {
+                        response = string.concat(response, "4");
+                }
+                response = string.concat(response, Strings.toString(playerNum));
+                response = string.concat(response, Strings.toString(_args));
+            }
+            // if action == 3 then startGame() called
+            else if(action == 3){
+                for(uint256 _prophet = 0; _prophet < NUMBER_OF_PROPHETS; _prophet++){
+                    bool successful = performMiracle(_prophet, chosenOne, _roleVRFSeed, 0);
+                    if(successful){
+                        response = string.concat(response, "1");
+                    }else {
+                        response = string.concat(response, "0");
+                    }
+                }
+            }
+            bytes32 fakeId;
+            bytes memory fakeErr;
+            bytes memory _response = bytes(response);
+            fulfillRequest(fakeId, _response, fakeErr);
+    }
+
+    function fulfillRequest(bytes32 requestId, bytes memory response, bytes memory err) internal {
+        //logic to change state of contract
+
+        if(response.length == 3){
+            // fancy syntax to get player number
+            uint256 playerNum = (uint8(response[1]) - uint(0x30));
+            //logic for unsuccessful miracle
+            if(response[0] == "0"){
+                // kill prophet
+                prophets[playerNum].isAlive = false;
+                // decrease number of remaining prophets
+                prophetsRemaining--;
+                // change action to IDLE
+                prophets[playerNum].currentAction = ProphetAction.IDLE;
+                
+                emit MiracleAttempt(playerNum, false);
+            }
+            // Logic for successful miracle
+            else if(response[0] == "1") {
+                // if in jail, release from jail
+                if(prophets[playerNum].isFree == false){
+                    prophets[playerNum].isFree = true;
+                }
+                // change action to IDLE
+                prophets[playerNum].currentAction = ProphetAction.IDLE;
+                emit MiracleAttempt(playerNum, true);
+            }
+            // Logic for an unsuccessful smite
+            else if(response[0] == "2") {
+                uint256 target = (uint8(response[2]) - uint(0x30));
+                prophets[playerNum].currentAction = ProphetAction.IDLE;
+                emit SmiteAttempt(playerNum, target, false);
+            }
+            // Logic for a successful smite
+            else if(response[0] == "3") {
+                uint256 target = (uint8(response[2]) - uint(0x30));
+                prophets[target].isAlive = false;
+                prophets[playerNum].currentAction = ProphetAction.IDLE;
+                prophetsRemaining--;
+                emit SmiteAttempt(playerNum, target, true);
+            }
+            // Logic for unsuccessful accusation
+            else if(response[0] == "4") {
+                uint256 target = (uint8(response[2]) - uint(0x30));
+                prophets[target].isFree = true;
+                prophets[playerNum].currentAction = ProphetAction.IDLE;
+                emit AccusationAttempt(playerNum, target, false);
+            }
+            // Logic for successful accusation
+            else if(response[0] == "5") {
+                uint256 target = (uint8(response[2]) - uint(0x30));
+                if(prophets[target].isFree == true){
+                    prophets[target].isFree = false;
+                } else {
+                    prophets[target].isAlive = false;
+                    prophetsRemaining--;
+                }
+                prophets[playerNum].currentAction = ProphetAction.IDLE;
+                emit AccusationAttempt(playerNum, target, true);
+            }
+            turnManager();
+            gameStatus = GameState.IN_PROGRESS;
+        } 
+        // Only time more than one response is returned is at start game
+        // This is the start game logic
+        else if(response.length > 3){
+            for(uint _prophet = 0; _prophet < response.length; _prophet++){
+                if(response[_prophet] == "1") {
+                    // assign allegiance to self
+                    allegiance[prophets[_prophet].playerAddress] = _prophet;
+                    // give Prophet one of his own tickets
+                    ticketsToValhalla[prophets[_prophet].playerAddress] = 1;
+                    // Increment total tickets by 1
+                    totalTickets++;
+                    // This loop initializes accolites[]
+                    // each loop pushes the number of accolites/tickets sold into the prophet slot of the array
+                    accolites.push(1);
+                    prophets[_prophet].currentAction = ProphetAction.IDLE;
+                }else {
+                    accolites.push(0);
+                    prophetsRemaining--;
+                    prophets[_prophet].isAlive = false;
+                    prophets[_prophet].args = 9;
+                    prophets[_prophet].currentAction = ProphetAction.IDLE;
+                }
+            }
+            gameStatus = GameState.IN_PROGRESS;
+            turnManager();
+        }else gameStatus = GameState.ENDED;
+    }
+
+    function turnManager() internal {
+        if(prophetsRemaining == 1){
+            gameStatus = GameState.ENDED;
+        } 
+        bool stillFinding = true;
+        uint256 nextProphetTurn = currentProphetTurn+1;
+        while(stillFinding){
+            if(nextProphetTurn >= NUMBER_OF_PROPHETS){
+                nextProphetTurn = 0;
+            }
+            if(prophets[nextProphetTurn].isAlive){
+                currentProphetTurn = nextProphetTurn;
+                gameRound++;
+                lastRoundTimestamp = block.timestamp;
+                stillFinding = false;
+            }
+            nextProphetTurn++;
+        }
+    }
+
+    function getTicketShare(uint256 _playerNum) public view returns(uint256) {
+        if(totalTickets == 0) return 0;
+        else return (accolites[_playerNum]*100) / totalTickets;
+    }
+
+    function performMiracle(uint256 _prophet, uint256 _chosenOne, uint256 _roleVRFSeed, uint256 ticketShare) public view returns(bool){
+        uint256 miracleOdds = 75;
+        if(_prophet == _chosenOne) {
+            return true;
+        }
+        else{
+            if(((_roleVRFSeed * block.timestamp * _prophet) % 100) - (ticketShare/10) <= miracleOdds) return true;
+            else return false;
+        }
+    }
+
+    function attemptToSmite(uint256 _prophet, uint256 _chosenOne, uint256 _ticketShare) public view returns(bool){
+        uint256 smiteOdds = 10;
+        if(_prophet == _chosenOne) {
+            return true;
+        }
+        else{
+            if(1+(uint256((block.timestamp * _prophet) % 100) - (_ticketShare/2)) <= smiteOdds) return true;
+            else return false;
+        }
+    }
+
+    function accuse(uint256 _playerNum, uint256 _ticketShare) public view returns(bool){
+        uint256 accuseOdds = 90;
+        if(1+(uint256((block.timestamp * _playerNum) % 100) + _ticketShare) > accuseOdds) return true;
+        else return false;
+    }
+
+/* 
+/ Generate Random number that is kept private from the blockchain by using Secrets in Chainlink Functions
+// Encryptor must be smaller than RandomSeed number returned from VRF --> 78 digits so >25 digits should be adequate
+
+const randomNumberSeed = args[0]
+const numberOfPlayers = args[1]
+const rand = Math.random();
+console.log(`rand = ${rand}`);
+
+// Divide Random Number by encryptor to obscure who is assigned Role
+// then modulo by number of players to select number
+const chosenOne = Math.floor(1+((randomNumberSeed/secrets.encryptor) % numberOfPlayers))
+console.log(`choseOne = ${chosenOne}`)
+
+// Return selected player number
+return Functions.encodeString(chosenOne.toString())*/
+
+////////////////////////////////////////////////////////////////////////////////////////////
+//////////// TICKET FUNCTIONS //////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////
+function highPriest(uint256 _prophetNum, uint256 _target) public {
+    if(msg.sender != prophets[_prophetNum].playerAddress && prophets[_prophetNum].args != 9){
+        revert Game__NotAllowed();
+    }
+    if(gameStatus != GameState.IN_PROGRESS){
+        revert Game__NotInProgress();
+    }
+    if(ticketsToValhalla[msg.sender] > 0){
+        accolites[allegiance[msg.sender]]--;
+        ticketsToValhalla[msg.sender]--;
+        allegiance[msg.sender] = 0;
+        totalTickets--;
+    }
+    accolites[_target]++;
+    ticketsToValhalla[msg.sender]++;
+    allegiance[msg.sender] = _target;
+    totalTickets++;
+}
+
+function getReligion(uint256 _prophetNum, uint256 _ticketsToBuy) public {
+        // Make sure game state allows for tickets to be bought
+        if(gameStatus != GameState.IN_PROGRESS){
+            revert Game__NotInProgress();
+        }
+        // Prophets cannot buy tickets  
+        if(prophetList[msg.sender] == 1){
+            revert Game__NotAllowed();
+        }
+        // Can't buy tickets of dead or nonexistent prophets
+        if(prophets[_prophetNum].isAlive == false || _prophetNum >= NUMBER_OF_PROPHETS){
+            revert Game__ProphetIsDead();
+        }
+        // Cannot buy/sell  tickets if address eliminated (allegiant to prophet when killed)
+        // Addresses that own no tickets will default allegiance to 0 but 0 is a player number
+        //  This causes issues with game logic so if allegiance is to 0 
+        //  we must also check if sending address owns tickets
+        // If the address owns tickets then they truly have allegiance to player 0
+        if(prophets[allegiance[msg.sender]].isAlive == false && ticketsToValhalla[msg.sender] != 0){
+            revert Game__AddressIsEliminated();
+        }
+        
+        // Check if player owns any tickets, if yes -> sell all tickets and buy 
+        if(ticketsToValhalla[msg.sender] != 0 && allegiance[msg.sender] != _prophetNum) {
+            //sell tickets of prior religion, function will assign allegiance to 0
+            sellTickets(allegiance[msg.sender], ticketsToValhalla[msg.sender], msg.sender);
+        }
+        
+        buyTicketsToValhalla(_prophetNum, _ticketsToBuy, msg.sender);
+    }
+
+    function loseReligion(uint256 _ticketsToSell) public {
+        if(gameStatus != GameState.IN_PROGRESS){
+            revert Game__NotInProgress();
+        }
+        // Can't sell tickets of a dead prophet
+        if(prophets[allegiance[msg.sender]].isAlive == false){
+            revert Game__ProphetIsDead();
+        }
+        // Prophets cannot sell tickets
+        if(prophetList[msg.sender] == 1){
+            revert Game__NotAllowed();
+        }
+        if(_ticketsToSell <= ticketsToValhalla[msg.sender]){
+            sellTickets(allegiance[msg.sender], _ticketsToSell, msg.sender);
+        } else revert Game__NotEnoughTicketsOwned();
+    }
+
+    function buyTicketsToValhalla(uint256 _prophetNum, uint256 _amountToBuy, address _buyerAddress) internal {
+        // check how many tickets exist for _playerNum
+        uint256 totalPrice;
+        uint256 ticketsBought = 0;
+        while(ticketsBought < _amountToBuy) {
+            ticketsBought++;
+            totalPrice += (((accolites[_prophetNum] + ticketsBought) * (accolites[_prophetNum] + ticketsBought)) * 1000000000000000000) / 8000;
+        }
+
+        ticketsToValhalla[_buyerAddress]+= ticketsBought;
+        accolites[_prophetNum]+= ticketsBought;
+        totalTickets += ticketsBought;
+        tokenBalance += totalPrice;
+        emit TicketsBought(_buyerAddress, ticketsBought, totalPrice);
+
+        IERC20(GAME_TOKEN).transferFrom(
+            _buyerAddress,
+            address(this),
+            totalPrice
+        );
+    }
+
+    function sellTickets(uint256 _prophetNum, uint256 _amountToSell, address _sellerAddress) internal {
+        uint256 totalPrice = 0;
+        uint256 ticketsSold = 0;
+        while(ticketsSold < _amountToSell){
+            totalPrice += (((accolites[_prophetNum]) * (accolites[_prophetNum]))*1000000000000000000 / 8000);
+            ticketsSold++;
+            accolites[_prophetNum]--;
+        }
+
+        totalTickets -= ticketsSold;
+        ticketsToValhalla[_sellerAddress] -= ticketsSold;
+        if(ticketsToValhalla[_sellerAddress] == 0) allegiance[_sellerAddress] = 0;
+        tokenBalance -= totalPrice;
+        emit TicketsSold(_sellerAddress, ticketsSold, totalPrice);
+
+        IERC20(GAME_TOKEN).transfer(
+            _sellerAddress,
+            totalPrice
+        );
+    }
+
+    function claimTickets() public {
+        if(gameStatus != GameState.ENDED){
+            revert Game__NotAllowed();
+        }
+        // TurnManager sets currentProphetTurn to game winner, so use this to check if allegiance is to the winner
+        if(allegiance[msg.sender] != currentProphetTurn){
+            revert Game__AddressIsEliminated();
+        }
+        if(ticketsToValhalla[msg.sender] == 0){
+            revert Game__NotEnoughTicketsOwned();
+        }
+        uint256 tokensPerTicket = tokenBalance/totalTickets;
+        uint256 tokensToSend = ticketsToValhalla[msg.sender]*tokensPerTicket;
+        ticketsToValhalla[msg.sender] = 0;
+
+        IERC20(GAME_TOKEN).transfer(
+            msg.sender,
+            tokensToSend
+        );
+    }
+}
