@@ -28,18 +28,10 @@ contract Phenomenon {
         ENDED
     }
 
-    enum ProphetAction{
-        MIRACLE,
-        SMITE,
-        ACCUSE,
-        IDLE
-    }
-
     struct ProphetData {
         address playerAddress;
         bool isAlive;
         bool isFree;
-        ProphetAction currentAction;
         uint256 args;
     }
 
@@ -116,7 +108,6 @@ contract Phenomenon {
         newProphet.playerAddress = msg.sender;
         newProphet.isAlive = true;
         newProphet.isFree = true;
-        newProphet.currentAction = ProphetAction.IDLE;
         prophets.push(newProphet);
         tokenBalance += _amount;
         prophetList[msg.sender] = 1;
@@ -163,7 +154,6 @@ contract Phenomenon {
             if(prophets[currentProphetTurn].isAlive == false){
                 revert Game__ProphetIsDead();
             }
-            prophets[currentProphetTurn].currentAction = ProphetAction.SMITE;
             prophets[currentProphetTurn].args = _target;
             sendRequest(1, roleVRFSeed, currentProphetTurn, _target);
         }
@@ -181,7 +171,6 @@ contract Phenomenon {
             if(prophets[currentProphetTurn].isAlive == false){
                 revert Game__ProphetIsDead();
             }
-            prophets[currentProphetTurn].currentAction = ProphetAction.MIRACLE;
             sendRequest(0, roleVRFSeed, currentProphetTurn, 0);
         }
     }
@@ -205,7 +194,6 @@ contract Phenomenon {
             if(prophets[currentProphetTurn].isFree == false){
                 revert Game__ProphetNotFree();
             }
-            prophets[currentProphetTurn].currentAction = ProphetAction.ACCUSE;
             sendRequest(2, roleVRFSeed, currentProphetTurn, _target);
         }
     }
@@ -288,14 +276,13 @@ contract Phenomenon {
         if(response.length == 3){
             // fancy syntax to get player number
             uint256 playerNum = (uint8(response[1]) - uint(0x30));
+            uint256 target = (uint8(response[2]) - uint(0x30));
             //logic for unsuccessful miracle
             if(response[0] == "0"){
                 // kill prophet
                 prophets[playerNum].isAlive = false;
                 // decrease number of remaining prophets
                 prophetsRemaining--;
-                // change action to IDLE
-                prophets[playerNum].currentAction = ProphetAction.IDLE;
                 
                 emit MiracleAttempt(playerNum, false);
             }
@@ -305,45 +292,35 @@ contract Phenomenon {
                 if(prophets[playerNum].isFree == false){
                     prophets[playerNum].isFree = true;
                 }
-                // change action to IDLE
-                prophets[playerNum].currentAction = ProphetAction.IDLE;
                 emit MiracleAttempt(playerNum, true);
             }
             // Logic for an unsuccessful smite
             else if(response[0] == "2") {
-                uint256 target = (uint8(response[2]) - uint(0x30));
-                prophets[playerNum].currentAction = ProphetAction.IDLE;
                 emit SmiteAttempt(playerNum, target, false);
             }
             // Logic for a successful smite
             else if(response[0] == "3") {
-                uint256 target = (uint8(response[2]) - uint(0x30));
                 prophets[target].isAlive = false;
-                prophets[playerNum].currentAction = ProphetAction.IDLE;
                 prophetsRemaining--;
                 emit SmiteAttempt(playerNum, target, true);
             }
             // Logic for unsuccessful accusation
             else if(response[0] == "4") {
-                uint256 target = (uint8(response[2]) - uint(0x30));
                 prophets[target].isFree = true;
-                prophets[playerNum].currentAction = ProphetAction.IDLE;
                 emit AccusationAttempt(playerNum, target, false);
             }
             // Logic for successful accusation
             else if(response[0] == "5") {
-                uint256 target = (uint8(response[2]) - uint(0x30));
                 if(prophets[target].isFree == true){
                     prophets[target].isFree = false;
                 } else {
                     prophets[target].isAlive = false;
                     prophetsRemaining--;
                 }
-                prophets[playerNum].currentAction = ProphetAction.IDLE;
                 emit AccusationAttempt(playerNum, target, true);
             }
-            turnManager();
             gameStatus = GameState.IN_PROGRESS;
+            turnManager();
         } 
         // Only time more than one response is returned is at start game
         // This is the start game logic
@@ -359,13 +336,11 @@ contract Phenomenon {
                     // This loop initializes accolites[]
                     // each loop pushes the number of accolites/tickets sold into the prophet slot of the array
                     accolites.push(1);
-                    prophets[_prophet].currentAction = ProphetAction.IDLE;
                 }else {
                     accolites.push(0);
                     prophetsRemaining--;
                     prophets[_prophet].isAlive = false;
                     prophets[_prophet].args = 9;
-                    prophets[_prophet].currentAction = ProphetAction.IDLE;
                 }
             }
             gameStatus = GameState.IN_PROGRESS;
@@ -494,6 +469,7 @@ function getReligion(uint256 _prophetNum, uint256 _ticketsToBuy) public {
         }
         
         buyTicketsToValhalla(_prophetNum, _ticketsToBuy, msg.sender);
+        allegiance[msg.sender] = _prophetNum;
     }
 
     function loseReligion(uint256 _ticketsToSell) public {
@@ -515,7 +491,7 @@ function getReligion(uint256 _prophetNum, uint256 _ticketsToBuy) public {
 
     function buyTicketsToValhalla(uint256 _prophetNum, uint256 _amountToBuy, address _buyerAddress) internal {
         // check how many tickets exist for _playerNum
-        uint256 totalPrice;
+        uint256 totalPrice =  0;
         uint256 ticketsBought = 0;
         while(ticketsBought < _amountToBuy) {
             ticketsBought++;
