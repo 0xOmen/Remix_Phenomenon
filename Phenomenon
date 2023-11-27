@@ -39,10 +39,11 @@ contract Phenomenon {
     uint256 ENTRANCE_FEE;
     uint16 NUMBER_OF_PROPHETS;
     address GAME_TOKEN;
+    uint256 GAME_NUMBER;
 
     uint256 tokenBalance;
     uint256 lastRoundTimestamp;
-    mapping (address => uint256) prophetList;
+    mapping (uint256 => mapping(address => uint256)) prophetList;
     ProphetData[] public prophets;
     GameState public gameStatus;
     uint256 public prophetsRemaining;
@@ -53,9 +54,9 @@ contract Phenomenon {
     uint256 public currentProphetTurn;
 
     // mapping of which prophet each address holds allegiance tickets to
-    mapping (address => uint256) public allegiance;
+    mapping (uint256 => mapping(address => uint256)) public allegiance; 
     // mapping of how many tickets an address owns
-    mapping (address => uint256) public ticketsToValhalla;
+    mapping (uint256 => mapping(address => uint256)) public ticketsToValhalla;
     //tracks how many tickets to heaven have been sold for each Prophet
     uint256[] public accolites;
     uint256 public totalTickets;
@@ -77,7 +78,7 @@ contract Phenomenon {
         INTERVAL = _interval;
         ENTRANCE_FEE = _entranceFee;
         NUMBER_OF_PROPHETS = _numProphets;
-        prophetsRemaining = _numProphets;
+        GAME_NUMBER = 0;
         gameStatus = GameState.OPEN;
         lastRoundTimestamp = block.timestamp;
         gameRound = 0;
@@ -110,7 +111,8 @@ contract Phenomenon {
         newProphet.isFree = true;
         prophets.push(newProphet);
         tokenBalance += _amount;
-        prophetList[msg.sender] = 1;
+        prophetList[GAME_NUMBER][msg.sender] = 1;
+        prophetsRemaining++;
         emit ProphetEnteredGame(msg.sender);
 
         IERC20(_tokenAddress).transferFrom(
@@ -203,6 +205,26 @@ contract Phenomenon {
             revert Game__NotAllowed();
         }
         sendRequest(0, roleVRFSeed, currentProphetTurn, 0);
+    }
+
+    function reset() public {
+        if(gameStatus != GameState.ENDED){
+            revert Game__NotInProgress();
+        }
+        if(block.timestamp < lastRoundTimestamp+INTERVAL){
+            revert Game__NotAllowed();
+        }
+
+        GAME_NUMBER++;
+        tokenBalance = 0;
+        delete prophets;                   //array of structs
+        gameStatus = GameState.OPEN;
+        prophetsRemaining = 0;
+        gameRound = 0;
+        currentProphetTurn = 0;
+
+        delete accolites;                  //array
+        totalTickets = 0;
     }
 ///////////////////////////////////////////////////////////////////////////////////
 //////////////////       Functions to execute OffChain          ///////////////////
@@ -328,9 +350,9 @@ contract Phenomenon {
             for(uint _prophet = 0; _prophet < response.length; _prophet++){
                 if(response[_prophet] == "1") {
                     // assign allegiance to self
-                    allegiance[prophets[_prophet].playerAddress] = _prophet;
+                    allegiance[GAME_NUMBER][prophets[_prophet].playerAddress] = _prophet;
                     // give Prophet one of his own tickets
-                    ticketsToValhalla[prophets[_prophet].playerAddress] = 1;
+                    ticketsToValhalla[GAME_NUMBER][prophets[_prophet].playerAddress] = 1;
                     // Increment total tickets by 1
                     totalTickets++;
                     // This loop initializes accolites[]
@@ -353,7 +375,7 @@ contract Phenomenon {
             gameStatus = GameState.ENDED;
         } 
         bool stillFinding = true;
-        uint256 nextProphetTurn = currentProphetTurn+1;
+        uint256 nextProphetTurn = currentProphetTurn + 1;
         while(stillFinding){
             if(nextProphetTurn >= NUMBER_OF_PROPHETS){
                 nextProphetTurn = 0;
@@ -428,15 +450,15 @@ function highPriest(uint256 _prophetNum, uint256 _target) public {
     if(gameStatus != GameState.IN_PROGRESS){
         revert Game__NotInProgress();
     }
-    if(ticketsToValhalla[msg.sender] > 0){
-        accolites[allegiance[msg.sender]]--;
-        ticketsToValhalla[msg.sender]--;
-        allegiance[msg.sender] = 0;
+    if(ticketsToValhalla[GAME_NUMBER][msg.sender] > 0){
+        accolites[allegiance[GAME_NUMBER][msg.sender]]--;
+        ticketsToValhalla[GAME_NUMBER][msg.sender]--;
+        allegiance[GAME_NUMBER][msg.sender] = 0;
         totalTickets--;
     }
     accolites[_target]++;
-    ticketsToValhalla[msg.sender]++;
-    allegiance[msg.sender] = _target;
+    ticketsToValhalla[GAME_NUMBER][msg.sender]++;
+    allegiance[GAME_NUMBER][msg.sender] = _target;
     totalTickets++;
 }
 
@@ -446,7 +468,7 @@ function getReligion(uint256 _prophetNum, uint256 _ticketsToBuy) public {
             revert Game__NotInProgress();
         }
         // Prophets cannot buy tickets  
-        if(prophetList[msg.sender] == 1){
+        if(prophetList[GAME_NUMBER][msg.sender] == 1){
             revert Game__NotAllowed();
         }
         // Can't buy tickets of dead or nonexistent prophets
@@ -458,18 +480,18 @@ function getReligion(uint256 _prophetNum, uint256 _ticketsToBuy) public {
         //  This causes issues with game logic so if allegiance is to 0 
         //  we must also check if sending address owns tickets
         // If the address owns tickets then they truly have allegiance to player 0
-        if(prophets[allegiance[msg.sender]].isAlive == false && ticketsToValhalla[msg.sender] != 0){
+        if(prophets[allegiance[GAME_NUMBER][msg.sender]].isAlive == false && ticketsToValhalla[GAME_NUMBER][msg.sender] != 0){
             revert Game__AddressIsEliminated();
         }
         
         // Check if player owns any tickets, if yes -> sell all tickets and buy 
-        if(ticketsToValhalla[msg.sender] != 0 && allegiance[msg.sender] != _prophetNum) {
+        if(ticketsToValhalla[GAME_NUMBER][msg.sender] != 0 && allegiance[GAME_NUMBER][msg.sender] != _prophetNum) {
             //sell tickets of prior religion, function will assign allegiance to 0
-            sellTickets(allegiance[msg.sender], ticketsToValhalla[msg.sender], msg.sender);
+            sellTickets(allegiance[GAME_NUMBER][msg.sender], ticketsToValhalla[GAME_NUMBER][msg.sender], msg.sender);
         }
         
         buyTicketsToValhalla(_prophetNum, _ticketsToBuy, msg.sender);
-        allegiance[msg.sender] = _prophetNum;
+        allegiance[GAME_NUMBER][msg.sender] = _prophetNum;
     }
 
     function loseReligion(uint256 _ticketsToSell) public {
@@ -477,15 +499,15 @@ function getReligion(uint256 _prophetNum, uint256 _ticketsToBuy) public {
             revert Game__NotInProgress();
         }
         // Can't sell tickets of a dead prophet
-        if(prophets[allegiance[msg.sender]].isAlive == false){
+        if(prophets[allegiance[GAME_NUMBER][msg.sender]].isAlive == false){
             revert Game__ProphetIsDead();
         }
         // Prophets cannot sell tickets
-        if(prophetList[msg.sender] == 1){
+        if(prophetList[GAME_NUMBER][msg.sender] == 1){
             revert Game__NotAllowed();
         }
-        if(_ticketsToSell <= ticketsToValhalla[msg.sender]){
-            sellTickets(allegiance[msg.sender], _ticketsToSell, msg.sender);
+        if(_ticketsToSell <= ticketsToValhalla[GAME_NUMBER][msg.sender]){
+            sellTickets(allegiance[GAME_NUMBER][msg.sender], _ticketsToSell, msg.sender);
         } else revert Game__NotEnoughTicketsOwned();
     }
 
@@ -498,7 +520,7 @@ function getReligion(uint256 _prophetNum, uint256 _ticketsToBuy) public {
             totalPrice += (((accolites[_prophetNum] + ticketsBought) * (accolites[_prophetNum] + ticketsBought)) * 1000000000000000000) / 8000;
         }
 
-        ticketsToValhalla[_buyerAddress]+= ticketsBought;
+        ticketsToValhalla[GAME_NUMBER][_buyerAddress]+= ticketsBought;
         accolites[_prophetNum]+= ticketsBought;
         totalTickets += ticketsBought;
         tokenBalance += totalPrice;
@@ -521,8 +543,8 @@ function getReligion(uint256 _prophetNum, uint256 _ticketsToBuy) public {
         }
 
         totalTickets -= ticketsSold;
-        ticketsToValhalla[_sellerAddress] -= ticketsSold;
-        if(ticketsToValhalla[_sellerAddress] == 0) allegiance[_sellerAddress] = 0;
+        ticketsToValhalla[GAME_NUMBER][_sellerAddress] -= ticketsSold;
+        if(ticketsToValhalla[GAME_NUMBER][_sellerAddress] == 0) allegiance[GAME_NUMBER][_sellerAddress] = 0;
         tokenBalance -= totalPrice;
         emit TicketsSold(_sellerAddress, ticketsSold, totalPrice);
 
@@ -537,15 +559,15 @@ function getReligion(uint256 _prophetNum, uint256 _ticketsToBuy) public {
             revert Game__NotAllowed();
         }
         // TurnManager sets currentProphetTurn to game winner, so use this to check if allegiance is to the winner
-        if(allegiance[msg.sender] != currentProphetTurn){
+        if(allegiance[GAME_NUMBER][msg.sender] != currentProphetTurn){
             revert Game__AddressIsEliminated();
         }
-        if(ticketsToValhalla[msg.sender] == 0){
+        if(ticketsToValhalla[GAME_NUMBER][msg.sender] == 0){
             revert Game__NotEnoughTicketsOwned();
         }
-        uint256 tokensPerTicket = tokenBalance/totalTickets;
-        uint256 tokensToSend = ticketsToValhalla[msg.sender]*tokensPerTicket;
-        ticketsToValhalla[msg.sender] = 0;
+        uint256 tokensPerTicket = tokenBalance/totalTickets;    // should be based off accolites
+        uint256 tokensToSend = ticketsToValhalla[GAME_NUMBER][msg.sender]*tokensPerTicket;
+        ticketsToValhalla[GAME_NUMBER][msg.sender] = 0;
 
         IERC20(GAME_TOKEN).transfer(
             msg.sender,
